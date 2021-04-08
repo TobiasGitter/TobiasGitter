@@ -1,0 +1,664 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# 
+# # Alpha Factor Evaluation
+
+# This notebook illustrates the following steps:
+# - Evaluate the predictive content of your financial features with respect to the 1-day forward returns using several metrics, including:
+# - the information coefficient (i.e., the Spearman rank correlation)
+# - the mutual information
+# - the LightGBM feature importance, computed by training a gradient boosting model with default settings on the first nine years of data 
+# - SHAP values computed from the LightGBM model (see resources)
+# - Alphalens quantile-based return spreads (see resources)
+# 
+# These different metrics will yield different and even conflicting answers. Take some time to think about why this is the case, and which approach(es) would likely be most effective when aiming to select the most predictive features?  
+
+# In[1]:
+
+
+import warnings
+warnings.filterwarnings('ignore')
+
+
+# In[2]:
+
+
+get_ipython().run_line_magic('matplotlib', 'inline')
+
+import os, sys
+from time import time
+
+from pathlib import Path
+import numpy as np
+import pandas as pd
+
+import statsmodels.api as sm
+from sklearn.feature_selection import mutual_info_regression
+from sklearn.preprocessing import scale
+import lightgbm as lgb
+from scipy.stats import spearmanr
+import shap
+
+from alphalens.tears import (create_returns_tear_sheet,
+                             create_summary_tear_sheet,
+                             create_full_tear_sheet)
+
+from alphalens import plotting
+from alphalens import performance as perf
+from alphalens import utils
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+
+# In[3]:
+
+
+sns.set_style('whitegrid')
+idx = pd.IndexSlice
+deciles = np.arange(.1, 1, .1).round(1)
+
+
+# In[4]:
+
+
+MONTH = 21
+YEAR = 251
+
+
+# ## Load Data
+
+# In[5]:
+
+
+data = pd.read_csv("./us_stocks_newer.csv", index_col=["ticker", "date"])
+data.head()
+
+
+# In[6]:
+
+
+data = data[data.columns[2:]].copy()
+data.shape
+
+
+# In[7]:
+
+
+# columns to drop because of na entries
+data = data.drop(["ADX", "STOCH1", "STOCH2", "ULTOSC", "ATR", "NATR"], axis=1)
+
+
+# In[8]:
+
+
+data = data.dropna(axis=0)
+
+
+# In[9]:
+
+
+is_NaN = data.isnull()
+row_has_NaN = is_NaN.any(axis=1)
+data[row_has_NaN]
+
+
+# In[10]:
+
+
+data.shape
+
+
+# ## Factor Correlation
+
+# Which features are most alike in terms of their (rank) correlation?
+
+# In[11]:
+
+
+x2n = data[data.columns[:-1]][:10000]
+y2n = data[data.columns[-1]][:10000]
+cor1, cor2 = spearmanr(x2n, y2n)
+cax = plt.matshow(cor2)
+plt.colorbar(cax)
+plt.show()
+
+
+# ## Forward return correlation
+
+# Which features are most correlated with the forward returns?
+
+# ## Mutual Information
+
+# Let's estimate the [mutual information](https://en.wikipedia.org/wiki/Mutual_information) between each feature and the forward returns for a non-linear measure of dependency (see scikit-learn [docs](https://scikit-learn.org/stable/modules/generated/sklearn.feature_selection.mutual_info_regression.html) for references on computation.
+# 
+# > The `mutual_info_regression` can take a while, reduce the sample size as indicated below to speed up things.
+
+# In[12]:
+
+
+x22n = data[data.columns[:-1]][10000:20000]
+y22n = data[data.columns[-1]][10000:20000]
+mutreg = mutual_info_regression(x22n, y22n)
+plt.plot(mutreg)
+
+
+# In[13]:
+
+
+for mut, col in zip(mutreg, data.columns):
+    if mut <0.01:
+        print(col, mut)
+
+
+# ## LightGBM Feature Importance
+
+# There will be more information on using [LightGBM](https://lightgbm.readthedocs.io/en/latest/) in Milestone 3.
+
+# ### Custom Time-Series Cross-Validation
+
+# See an example of how the `MultipleTimeSeriesCV` generates sequential, overlapping time periods for training and test in cells 11-13 [here](https://github.com/stefan-jansen/machine-learning-for-trading/blob/master/07_linear_models/05_predicting_stock_returns_with_linear_regression.ipynb).
+
+# In[14]:
+
+
+class MultipleTimeSeriesCV:
+    """Generates tuples of train_idx, test_idx pairs
+    Assumes the MultiIndex contains levels 'symbol' and 'date'
+    purges overlapping outcomes"""
+
+    def __init__(self,
+                 n_splits=3,
+                 train_period_length=126,
+                 test_period_length=21,
+                 lookahead=None,
+                 date_idx='date',
+                 shuffle=False):
+        self.n_splits = n_splits
+        self.lookahead = lookahead
+        self.test_length = test_period_length
+        self.train_length = train_period_length
+        self.shuffle = shuffle
+        self.date_idx = date_idx
+
+    def split(self, X, y=None, groups=None):
+        """Generate the positional indices for the train-test splits for each fold"""
+        unique_dates = X.index.get_level_values(self.date_idx).unique() # get unique dates
+        days = sorted(unique_dates, reverse=True)
+        split_idx = []
+        for i in range(self.n_splits):
+            # create train/test start and end indices
+            test_end_idx = i * self.test_length
+            test_start_idx = test_end_idx + self.test_length
+            train_end_idx = test_start_idx + self.lookahead - 1
+            train_start_idx = train_end_idx + self.train_length + self.lookahead - 1
+            split_idx.append([train_start_idx, train_end_idx,
+                              test_start_idx, test_end_idx])
+        dates = X.reset_index()[[self.date_idx]]
+        
+        for train_start, train_end, test_start, test_end in split_idx:
+            train_idx = dates[(dates[self.date_idx] > days[train_start])
+                              & (dates.date <= days[train_end])].index
+            test_idx = dates[(dates.date > days[test_start])
+                             & (dates.date <= days[test_end])].index
+            if self.shuffle:
+                np.random.shuffle(list(train_idx))
+            yield train_idx.to_numpy(), test_idx.to_numpy()
+
+    def get_n_splits(self, X, y, groups=None):
+        return self.n_splits
+
+
+# ### Custom Metric for Early Stopping
+# 
+# We can customize how LightGBM measures cross-validation progress, and will use the information coefficient. See LightGBM [docs](https://github.com/Microsoft/LightGBM/blob/master/examples/python-guide/advanced_example.py).
+# 
+# > Keep in mind that early-stopping introduces lookahead bias, so do not use this to select between different model.
+
+# In[15]:
+
+
+def ic_lgbm(preds, train_data):
+    """Custom IC eval metric for lightgbm"""
+    is_higher_better = True # whether to maximize or minimize the metric
+    metric_name = 'ic'
+    ic = spearmanr(preds, train_data.get_label())[0]
+    return metric_name, ic, is_higher_better 
+
+
+# ### CV Parameters
+
+# In[16]:
+
+
+categoricals = ['weekday']
+
+
+# In[17]:
+
+
+train_length = 3 * YEAR
+test_length = YEAR
+n_splits = 1
+
+
+# In[18]:
+
+
+params = dict(boosting='gbdt',
+              objective='regression',
+              verbose=-1,
+              learning_rate=0.01)
+
+
+# In[19]:
+
+
+num_boost_round = 5000
+
+
+# ### Create binary Datasets
+# 
+# See LightGBM [docs](https://lightgbm.readthedocs.io/en/latest/pythonapi/lightgbm.Dataset.html#lightgbm.Dataset) on the `lgb.Dataset`.
+
+# In[20]:
+
+
+factors = data[data.columns[:-1]]
+labels = data[data.columns[-1]]
+
+
+# In[21]:
+
+
+lgb_data = lgb.Dataset(data=factors,
+                       label=labels,
+                       free_raw_data=False)
+
+
+# In[22]:
+
+
+cv = MultipleTimeSeriesCV(n_splits=n_splits,
+                          lookahead=1,
+                          test_period_length=test_length,
+                          train_period_length=train_length)
+
+
+# ### Cross-validation loop
+
+# In[24]:
+
+
+for train_idx, test_idx in cv.split(X=factors):
+    start = time()
+    lgb_train = lgb_data.subset(train_idx.tolist()).construct()
+    lgb_test = lgb_data.subset(test_idx.tolist()).construct()
+    evals_result = {}
+    model = lgb.train(params=params,
+                      train_set=lgb_train,
+                      num_boost_round=num_boost_round,
+                      valid_sets=[lgb_train, lgb_test],
+                      valid_names=['train', 'valid'],
+                      feval=ic_lgbm,
+                      evals_result=evals_result,
+                      early_stopping_rounds=500,
+                      verbose_eval=100)
+    model.save_model('lgb_model.txt')
+
+
+# We can persist the model to generate predictions later:
+
+# In[25]:
+
+
+model = lgb.Booster(model_file='lgb_model.txt')
+
+
+# ### Generate and evaluate predictions
+
+# In[26]:
+
+
+# select test features and label
+X_test = data[data.columns[:-1]].iloc[test_idx, :]
+y_test = data[data.columns[-1:]].iloc[test_idx, :]["outcome"]
+
+# make predictions
+y_pred = model.predict(X_test, predict_disable_shape_check=True)
+cv_preds = y_test.to_frame('y_test').assign(y_pred=y_pred)
+
+# compute daily correlation
+by_day = cv_preds.groupby(level='date')
+ic_by_day = by_day.apply(lambda x: spearmanr(x.y_test, x.y_pred)[0])
+daily_ic_mean = ic_by_day.mean()
+daily_ic_std = ic_by_day.std()
+daily_ic_median = ic_by_day.median()
+ic = spearmanr(cv_preds.y_test, cv_preds.y_pred)[0]
+print(f'Overall IC: {ic:6.2%} | Average Daily IC: {daily_ic_mean: 6.2%} | Coefficient of Variation for daily IC: {daily_ic_std/daily_ic_mean: 5.2} | Median Daily IC: {daily_ic_median: 6.2%}')
+
+
+# While the daily average of the IC is positive at 0.028, it is also quite volatile. In other words, predictions will do quite poorly occasionally (and much better otherwise).
+
+# In[27]:
+
+
+sns.displot(ic_by_day);
+
+
+# Higher momemts (Skew and Kurtosis) confirm that, while only slightly negatively skewed, but has significantly fatter tails than a normal distribution (pandas uses [Fisher's definition](https://pandas.pydata.org/pandas-docs/stable/reference/api/pandas.DataFrame.kurtosis.html)).
+
+# In[28]:
+
+
+pd.Series({'Mean': ic_by_day.mean(), 
+           'Std. Dev': ic_by_day.std(), 
+           'Median': ic_by_day.median(), 
+           'Skew': ic_by_day.skew(), 
+           'Kurtosis': ic_by_day.kurtosis()}).apply(lambda x: f'{x:.4f}')
+
+
+# ### Compute Feature Importance
+
+# In[29]:
+
+
+def get_fi(model):
+    """Compute LightGBM feature imporance"""
+    fi = model.feature_importance(importance_type='gain')
+    return (pd.Series(fi / fi.sum(),
+                      index=model.feature_name()))
+
+
+# In[30]:
+
+
+fi = get_fi(model)
+fi.to_csv('feature_importance.csv')
+
+
+# In[31]:
+
+
+cv_result = pd.DataFrame({'Train Set': evals_result['train']['ic'], 
+                          'Validation Set': evals_result['valid']['ic']})
+
+
+# In[32]:
+
+
+ax = cv_result.plot(figsize=(12, 4))
+ax.axvline(cv_result['Validation Set'].idxmax(), c='k', ls='--', lw=1)
+sns.despine();
+
+
+# In[33]:
+
+
+fi.nlargest(25).sort_values().plot.barh(figsize=(8, 8),
+                                        title='LightGBM Feature Importance')
+sns.despine();
+
+
+# ## SHAP Values
+
+# See SHAP Values [GitHub repo](https://github.com/slundberg/shap) for docs and links to papers.
+
+# In[34]:
+
+
+shap.initjs()
+
+
+# In[35]:
+
+
+model = lgb.Booster(model_file='lgb_model.txt')
+
+
+# In[36]:
+
+
+explainer = shap.TreeExplainer(model)
+
+
+# In[37]:
+
+
+# workaround for SHAP version 0.35: https://github.com/slundberg/shap/issues/794
+model.params['objective'] = 'regression'
+
+
+# In[38]:
+
+
+shap_values = explainer.shap_values(factors.iloc[test_idx, :])
+
+
+# In[39]:
+
+
+np.save('shap_values.npy', shap_values)
+
+
+# In[40]:
+
+
+shap_values = np.load('shap_values.npy')
+
+
+# In[41]:
+
+
+shap.summary_plot(shap_values,
+                  X_test,
+                  show=False)
+
+plt.gcf().suptitle('SHAP Values')
+plt.gcf().tight_layout()
+
+
+# In[43]:
+
+
+shap_values = pd.DataFrame(shap_values, columns=factors.columns)
+
+
+# In[44]:
+
+
+shap_summary = np.abs(shap_values).mean()
+shap_summary /= shap_summary.sum()
+
+
+# In[45]:
+
+
+shap_summary.nlargest(20)
+
+
+# In[46]:
+
+
+shap_summary.to_csv('shap_values.csv')
+
+
+# ## Comparison
+
+# In[47]:
+
+
+mi = pd.read_csv('mutual_info.csv', index_col=0, squeeze=True)
+fwd_corr = pd.read_csv('forward_correlation.csv', index_col=0, squeeze=True)
+
+
+# In[ ]:
+
+
+stats = (mi.to_frame('Mutual Information')
+         .join(fwd_corr.to_frame('Information Coefficient'))
+         .join(fi.to_frame('Feature Importance'))
+         .join(shap_summary.to_frame('SHAP Values')))
+
+
+# In[ ]:
+
+
+cols = {'Information Coefficient': stats['Information Coefficient'].abs()}
+
+corr = stats.assign(**cols).corr('spearman')
+
+mask = np.triu(np.ones_like(corr, dtype=np.bool))
+corr = corr.iloc[1:, :-1]
+mask = mask[1:, :-1]
+
+fig, ax = plt.subplots(figsize=(8, 5))
+
+cmap = sns.diverging_palette(10, 220, as_cmap=True)
+
+sns.heatmap(corr, mask=mask,
+            cmap=cmap,
+            vmax=.3, center=0,
+            square=True, linewidths=.5,
+            cbar_kws={"shrink": .5},
+            annot=True, fmt='.2f',
+            annot_kws={"size": 13})
+
+plt.xticks(rotation=0)
+fig.suptitle('Rank Correlation of Feature Metrics', fontsize=14)
+fig.tight_layout()
+fig.subplots_adjust(top=.92)
+
+
+# In[ ]:
+
+
+top_n = 25
+fig, axes = plt.subplots(ncols=4, figsize=(16, 8))
+
+shap_summary.nlargest(top_n).sort_values().plot.barh(ax=axes[0], title='SHAP Values')
+
+fi.nlargest(top_n).sort_values().plot.barh(ax=axes[1], title='Feature Importance')
+
+mi.nlargest(top_n).sort_values().plot.barh(ax=axes[2], title='Mutual Information')
+
+top_corr = fwd_corr.abs().nlargest(top_n).index
+fwd_corr.loc[top_corr].sort_values().plot.barh(ax=axes[3], title='Information Coefficient')
+
+fig.suptitle('Univariate and Multivariate Feature Evaluation Metrics', fontsize=14)
+fig.tight_layout()
+fig.subplots_adjust(top=.91);
+
+
+# In[ ]:
+
+
+top_ranked = stats.drop('Mutual Information', axis=1).abs().rank(ascending=False).mean(1)
+
+
+# In[ ]:
+
+
+top_ranked.to_csv('top_features.csv')
+
+
+# In[ ]:
+
+
+top_ranked.drop(categoricals).nsmallest(20).plot.bar(figsize=(16, 4), rot=0, title='Top-ranked factors')
+sns.despine()
+plt.tight_layout();
+
+
+# ## Alphalens Analysis
+
+# Alphalens is a Python Library (originally developed by Quantopian) for performance analysis of predictive (alpha) stock factors. Alphalens works great with the Zipline open source backtesting library, and Pyfolio which provides performance and risk analysis of financial portfolios. 
+# 
+# The main function of Alphalens is to surface the most relevant statistics and plots about an alpha factor, including:
+# 
+# - Returns Analysis
+# - Information Coefficient Analysis
+# - Turnover Analysis
+# - Grouped Analysis
+# 
+# See Alphalens [docs](https://quantopian.github.io/alphalens/) and [example notebooks](https://github.com/quantopian/alphalens/tree/master/alphalens/examples) for additional detail.
+
+# In[48]:
+
+
+tickers = factors.index.unique('ticker')
+
+
+# ### Get trade prices
+
+# We need market prices for the relevant period:
+
+# In[53]:
+
+
+def get_trade_prices(tickers):
+    return (pd.read_csv('./us_stocks.csv')
+              .loc[idx[tickers, '2006':'2017'], 'open']
+              .unstack('ticker')
+              .sort_index()
+            .shift(-1)
+            .tz_localize('UTC'))
+
+
+# In[ ]:
+
+
+trade_prices = pd.read_csv("./us_stocks.csv")
+
+
+# In[ ]:
+
+
+trade_prices.info()
+
+
+# ### Select factor
+
+# We also need the factor signals that we want to evaluate:
+
+# In[ ]:
+
+
+alpha = 'ATR'
+
+
+# In[ ]:
+
+
+factor = (factors[alpha]
+          .unstack('ticker')
+          .stack()
+          .tz_localize('UTC', level='date')
+          .sort_index())
+
+
+# ### Generate Alphalens input data
+
+# With a signal and pricing data creating a factor "tear sheet" is a two step process:
+# 1. Bring data into the right format
+# 2. Select desired tearsheet.
+
+# In[ ]:
+
+
+factor_data = utils.get_clean_factor_and_forward_returns(factor=factor,d
+                                                   prices=trade_prices,
+                                                   quantiles=5,
+                                                   max_loss=0.35,
+                                                   periods=(1, 5, 10)).sort_index()
+factor_data.info()
+
+
+# ### Create Tearsheet
+
+# In[ ]:
+
+
+create_summary_tear_sheet(factor_data)
+
