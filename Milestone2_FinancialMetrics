@@ -1,0 +1,568 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# # Engineering Predictive Alpha Factors
+
+# This notebook illustrates the following steps:
+# 
+# 1. Select the adjusted open, high, low, and close prices as well as the volume for all tickers from the Quandl Wiki data that you downloaded and simplified for the last milestone for the 2007-2016 time period. Looking ahead, we will use 2014-2016 as our 'out-of-sample' period to test the performance of a strategy based on a machine learning model selected using data from preceding periods.
+# 2. Compute the dollar volume as the product of closing price and trading volume; then select the stocks with at least eight years of data and the lowest average daily rank for this metric. 
+# 3. Compute daily returns and keep only 'inliers' with values between -100% and + 100% as a basic check against data error.
+# 4. Now we're ready to compute financial features. The Alpha Factory Library listed among the resources below illustrates how to compute a broad range of those using pandas and TA-Lib. We will list a few examples; feel free to explore and evaluate the various TA-Lib indicators.
+#     - Compute **historical returns** for various time ranges such as 1, 3, 5, 10, 21 trading days, as well as longer periods like 2, 3, 6 and 12 months.
+#     - Use TA-Lib's **Bollinger Band** indicator to create features that anticipate **mean-reversion**.
+#     - Select some indicators from TA-Lib's **momentum** indicators family such as
+#         - the Average Directional Movement Index (ADX), 
+#         - the Moving Average Convergence Divergence (MACD), 
+#         - the Relative Strength Index (RSI), 
+#         - the Balance of Power (BOP) indictor, or 
+#         - the Money Flow Index (MFI).
+#     - Compute TA-Lib **volume** indicators like On Balance Volume (OBV) or the Chaikin A/D Oscillator (ADOSC)
+#     - Create volatility metrics such as the Normalized Average True Range (NATR).
+#     - Compute rolling factor betas using the five Fama-French risk factors for different rolling windows of three and 12 months (see resources below).
+#     - Compute the outcome variable that we will aim to predict, namely the 1-day forward returns.
+
+# ## Usage tips
+# 
+# - If you experience resource constraints (suddenly restarting Kernel), increase the memory available for Docker Desktop (> Settings > Advanced). If this not possible or you experienced prolonged execution times, reduce the scope of the exercise. The easiest way to do so is to select fewer stocks or a shorter time period, or both.
+# - You may want to persist intermediate results so you can recover quickly in case something goes wrong. There's an example under the first 'Persist Results' subsection.
+
+# ## Imports & Settings
+
+# In[1]:
+
+
+import warnings
+warnings.filterwarnings('ignore')
+
+
+# In[2]:
+
+
+get_ipython().run_line_magic('matplotlib', 'inline')
+
+from pathlib import Path
+import numpy as np
+import pandas as pd
+
+import statsmodels.api as sm
+from statsmodels.regression.rolling import RollingOLS
+from sklearn.preprocessing import scale
+import talib
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+
+# In[3]:
+
+
+sns.set_style('whitegrid')
+idx = pd.IndexSlice
+deciles = np.arange(.1, 1, .1).round(1)
+
+
+# ## Load Data
+
+# In[4]:
+
+
+data = pd.read_csv("./us_stocks_new.csv", index_col=False)
+
+
+# ## Select 500 most-traded stocks prior to 2017
+
+# Compute the dollar volume as the product of the adjusted close price and the adjusted volume:
+
+# In[5]:
+
+
+data["dollarVolume"] = data.close * data.volume
+data.shape
+
+
+# In[6]:
+
+
+ticker_names = data.groupby("ticker").mean().sort_values("dollarVolume").index[-500:]
+data["check"] = data.ticker.isin(ticker_names)
+newData = data[data.check].copy().drop("check", axis=1)
+
+
+# In[7]:
+
+
+newData = newData.reset_index(drop=True)
+
+
+# In[8]:
+
+
+# Compute historical returns for various time ranges such as 1, 3, 5, 10, 21 trading days, 
+# as well as longer periods like 2, 3, 6 and 12 months.
+def getReturns(timeframe, closes = newData.close, tickers = newData.ticker):
+    returns = [np.nan for i in range(timeframe)]
+    for i in range(timeframe, len(closes)):
+        if tickers[i] !=  tickers[i-timeframe]:
+            new_return = np.nan
+        else:
+            new_return = closes[i] / closes[i-timeframe] - 1
+        returns.append(new_return)
+    return returns
+
+
+# In[9]:
+
+
+newData["daily returns"] = getReturns(1)
+newData = newData[newData["daily returns"] <= 1].copy()
+newData = newData.reset_index(drop=True)
+
+
+# In[10]:
+
+
+plt.plot(newData["daily returns"])
+
+
+# ## Remove outliers based on daily returns
+
+# In[11]:
+
+
+return_timeframes = [1, 3, 5, 10, 21, 60, 90, 180, 360]
+for timeframe in return_timeframes:
+    newData[f"returns {timeframe}"] = getReturns(timeframe, newData.close, newData.ticker)
+
+
+# ## Compute returns
+
+# ## Bollinger Bands
+
+# In[12]:
+
+
+newData["upperBol"], newData["middleBol"], newData["lowerBol"] = talib.BBANDS(newData.close, matype=talib.MA_Type.T3)
+
+
+# ## Momentum Indicators
+
+# In[13]:
+
+
+newData["momentum"] = talib.MOM(newData.close, timeperiod=5)
+
+
+# TA-Lib offers the following choices - feel free to experiment with as many as you like (but you don't have to..):
+
+# |Function|             Name|
+# |:---|:---|
+# |PLUS_DM|              Plus Directional Movement|
+# |MINUS_DM|             Minus Directional Movement|
+# |PLUS_DI|              Plus Directional Indicator|
+# |MINUS_DI|             Minus Directional Indicator|
+# |DX|                   Directional Movement Index|
+# |ADX|                  Average Directional Movement Index|
+# |ADXR|                 Average Directional Movement Index Rating|
+# |APO|                  Absolute Price Oscillator|
+# |PPO|                  Percentage Price Oscillator|
+# |AROON|                Aroon|
+# |AROONOSC|             Aroon Oscillator|
+# |BOP|                  Balance Of Power|
+# |CCI|                  Commodity Channel Index|
+# |CMO|                  Chande Momentum Oscillator|
+# |MACD|                 Moving Average Convergence/Divergence|
+# |MACDEXT|              MACD with controllable MA type|
+# |MACDFIX|              Moving Average Convergence/Divergence Fix 12/26|
+# |MFI|                  Money Flow Index|
+# |MOM|                  Momentum|
+# |RSI|                  Relative Strength Index|
+# |STOCH|                Stochastic|
+# |STOCHF|               Stochastic Fast|
+# |STOCHRSI|             Stochastic Relative Strength Index|
+# |TRIX|                 1-day Rate-Of-Change (ROC) of a Triple Smooth EMA|
+# |ULTOSC|               Ultimate Oscillator|
+# |WILLR|                Williams' %R|
+
+# ### Average Directional Movement Index (ADX)
+
+# The ADX combines of two other indicators, namely the positive and directional indicators (PLUS_DI and MINUS_DI), which in turn build on the positive and directional movement (PLUS_DM and MINUS_DM). For additional details see [Wikipdia](https://en.wikipedia.org/wiki/Average_directional_movement_index) and [Investopedia](https://www.investopedia.com/articles/trading/07/adx-trend-indicator.asp).
+
+# In[14]:
+
+
+newData["ADX"] = talib.ADX(newData.high, newData.low, newData.close)
+
+
+# ### Absolute Price Oscillator (APO)
+
+# The absolute Price Oscillator (APO) is computed as the difference between two exponential moving averages (EMA) of price series, expressed as an absolute value. The EMA windows usually contain 26 and 12 data points, respectively.
+
+# In[15]:
+
+
+newData["APO"] = talib.APO(newData.close)
+
+
+# ### Percentage Price Oscillator (PPO)
+
+# The Percentage Price Oscillator (APO) is computed as the difference between two exponential moving averages (EMA) of price series, expressed as a percentage value and thus comparable across assets. The EMA windows usually contain 26 and 12 data points, respectively. 
+
+# In[16]:
+
+
+newData["PPO"] = talib.PPO(newData.close)
+
+
+# ### Aroon Oscillator
+
+# #### Aroon Up/Down Indicator
+
+# In[17]:
+
+
+newData["aroondown"], newData["aroonup"] = talib.AROON(newData.high, newData.low, timeperiod=14)
+
+
+# The indicator measures the time between highs and the time between lows over a time period. It computes an AROON_UP and an AROON_DWN indicator as follows:
+# 
+# $$
+# \begin{align*}
+# \text{AROON_UP}&=\frac{T-\text{Periods since T period High}}{T}\times 100\\
+# \text{AROON_DWN}&=\frac{T-\text{Periods since T period Low}}{T}\times 100
+# \end{align*}
+# $$
+
+# #### Aroon Oscillator
+
+# The Aroon Oscillator is simply the difference between the Aroon Up and Aroon Down indicators.
+
+# In[18]:
+
+
+newData["aroonOsc"] = newData.aroonup - newData.aroondown
+
+
+# ### Balance Of Power (BOP)
+
+# The Balance of Power (BOP) intends to measure the strength of buyers relative to sellers in the market by assessing the ability of each side to drive prices. It is computer as the difference between the close and the open price, divided by the difference between the high and the low price: 
+# 
+# $$
+# \text{BOP}_t= \frac{P_t^\text{Close}-P_t^\text{Open}}{P_t^\text{High}-P_t^\text{Low}}
+# $$
+
+# In[19]:
+
+
+newData["BOP"] = (newData.close - newData.open) / (newData.high - newData.low)
+
+
+# ### Commodity Channel Index (CCI)
+
+# The Commodity Channel Index (CCI) measures the difference between the current *typical* price, computed as the average of current low, high and close price and the historical average price. A positive (negative) CCI indicates that price is above (below) the historic average. When CCI is below zero, the price is below the hsitoric average. It is computed as:
+# 
+# $$
+# \begin{align*}
+# \bar{P_t}&=\frac{P_t^H+P_t^L+P_t^C}{3}\\
+# \text{CCI}_t & =\frac{\bar{P_t} - \text{SMA}(T)_t}{0.15\sum_{t=i}^T |\bar{P_t}-\text{SMA}(N)_t|/T}
+# \end{align*}
+# $$
+
+# In[20]:
+
+
+newData["CCI"] = talib.CCI(newData.high, newData.low, newData.close)
+
+
+# ### Moving Average Convergence/Divergence (MACD)
+
+# Moving Average Convergence Divergence (MACD) is a trend-following (lagging) momentum indicator that shows the relationship between two moving averages of a security’s price. It is calculated by subtracting the 26-period Exponential Moving Average (EMA) from the 12-period EMA.
+# 
+# The TA-Lib implementation returns the MACD value and its signal line, which is the 9-day EMA of the MACD. In addition, the MACD-Histogram measures the distance between the indicator and its signal line.
+
+# In[21]:
+
+
+newData["MACD1"], newData["MACD2"], newData["MACD3"] = talib.MACD(newData.close)
+
+
+# ### Chande Momentum Oscillator (CMO)
+
+# The Chande Momentum Oscillator (CMO) intends to measure momentum on both up and down days. It is calculated as the difference between the sum of gains and losses over at time period T, divided by the sum of all price movement over the same period. It oscillates between +100 and -100.
+
+# In[22]:
+
+
+newData["CMO"] = talib.CMO(newData.close)
+
+
+# ### Money Flow Index
+
+# The Money Flow Index (MFI) incorporates price and volume information to identify overbought or oversold conditions.  The indicator is typically calculated using 14 periods of data. An MFI reading above 80 is considered overbought and an MFI reading below 20 is considered oversold.
+
+# In[23]:
+
+
+newData["MFI"] = talib.MFI(newData.high, newData.low, newData.close, newData.volume)
+
+
+# ### Relative Strength Index
+
+# RSI compares the magnitude of recent price changes across stocks to identify stocks as overbought or oversold. A high RSI (usually above 70) indicates overbought and a low RSI (typically below 30) indicates oversold. It first computes the average price change for a given number (often 14) of prior trading days with rising and falling prices, respectively as $\text{up}_t$ and $\text{down}_t$. Then, the RSI is computed as:
+# $$
+# \text{RSI}_t=100-\frac{100}{1+\frac{\text{up}_t}{\text{down}_t}}
+# $$
+# 
+# 
+
+# In[24]:
+
+
+newData["RSI"] = talib.RSI(newData.close, timeperiod=14)
+
+
+# #### Stochastic RSI (STOCHRSI)
+
+# The Stochastic Relative Strength Index (STOCHRSI) is based on the RSI just described and intends to identify crossovers as well as overbought and oversold conditions. It compares the distance of the current RSI to the lowest RSI over a given time period T to the maximum range of values the RSI has assumed for this period. It is computed as follows:
+# 
+# $$
+# \text{STOCHRSI}_t= \frac{\text{RSI}_t-\text{RSI}_t^L(T)}{\text{RSI}_t^H(T)-\text{RSI}_t^L(T)}
+# $$
+# 
+# The TA-Lib implementation offers more flexibility than the original "Unsmoothed stochastic RSI" version by Chande and Kroll (1993). To calculate the original indicator, keep the `timeperiod` and `fastk_period` equal. 
+# 
+# The return value `fastk` is the unsmoothed RSI. The `fastd_period` is used to compute a smoothed STOCHRSI, which  is returned as `fastd`. If you do not care about STOCHRSI smoothing, just set `fastd_period` to 1 and ignore the `fastd` output.
+# 
+# Reference: "Stochastic RSI and Dynamic Momentum Index" by Tushar Chande and Stanley Kroll Stock&Commodities V.11:5 (189-199)
+# 
+
+# In[25]:
+
+
+newData["STOCHRSI1"], newData["StochRSI2"] = talib.STOCHRSI(newData.close)
+
+
+# ### Stochastic (STOCH)
+
+# A stochastic oscillator is a momentum indicator comparing a particular closing price of a security to a range of its prices over a certain period of time. Stochastic oscillators are based on the idea that closing prices should confirm the trend.
+
+# In[26]:
+
+
+newData["STOCH1"], newData["STOCH2"] = talib.STOCH(newData.high, newData.low, newData.close)
+
+
+# For stochastic (STOCH), there are four different lines: `FASTK`, `FASTD`, `SLOWK` and `SLOWD`. The `D` is the signal line usually drawn over its corresponding `K` function.
+# 
+# $$
+# \begin{align*}
+# & K^\text{Fast}(T_K) & = &\frac{P_t-P_{T_K}^L}{P_{T_K}^H-P_{T_K}^L}* 100 \\
+# & D^\text{Fast}(T_{\text{FastD}}) & = & \text{MA}(T_{\text{FastD}})[K^\text{Fast}]\\
+# & K^\text{Slow}(T_{\text{SlowK}}) & = &\text{MA}(T_{\text{SlowK}})[K^\text{Fast}]\\
+# & D^\text{Slow}(T_{\text{SlowD}}) & = &\text{MA}(T_{\text{SlowD}})[K^\text{Slow}]
+# \end{align*}
+# $$
+#   
+# 
+# The $P_{T_K}^L$, $P_{T_K}^H$, and $P_{T_K}^L$ are the extreme values among the last $T_K$ period.
+#  $K^\text{Slow}$ and $D^\text{Fast}$ are equivalent when using the same period. 
+
+# ### Ultimate Oscillator (ULTOSC)
+
+# The Ultimate Oscillator (ULTOSC), developed by Larry Williams, measures the average difference of the current close to the previous lowest price over three time frames (default: 7, 14, and 28) to avoid overreacting to short-term price changes and incorporat short, medium, and long-term market trends. It first computes the buying pressure, $\text{BP}_t$, then sums it over the three periods $T_1, T_2, T_3$, normalized by the True Range ($\text{TR}_t$.
+# $$
+# \begin{align*}
+# \text{BP}_t & = P_t^\text{Close}-\min(P_{t-1}^\text{Close}, P_t^\text{Low})\\ 
+# \text{TR}_t & = \max(P_{t-1}^\text{Close}, P_t^\text{High})-\min(P_{t-1}^\text{Close}, P_t^\text{Low})
+# \end{align*}
+# $$
+# 
+# ULTOSC is then computed as a weighted average over the three periods as follows:
+# $$
+# \begin{align*}
+# \text{Avg}_t(T) & = \frac{\sum_{i=0}^{T-1} \text{BP}_{t-i}}{\sum_{i=0}^{T-1} \text{TR}_{t-i}}\\
+# \text{ULTOSC}_t & = 100*\frac{4\text{Avg}_t(7) + 2\text{Avg}_t(14) + \text{Avg}_t(28)}{4+2+1}
+# \end{align*}
+# $$
+
+# In[27]:
+
+
+newData["ULTOSC"] = talib.ULTOSC(newData.high, newData.low, newData.close)
+
+
+# ### Williams' %R (WILLR)
+
+# Williams %R, also known as the Williams Percent Range, is a momentum indicator that moves between 0 and -100 and measures overbought and oversold levels to identify entry and exit points. It is similar to the Stochastic oscillator and compares the current closing price $P_t^\text{Close}$ to the range of highest ($P_T^\text{High}$) and lowest ($P_T^\text{Low}$) prices over the last T periods (typically 14). The indicators is computed as:
+# 
+# $$
+# \text{WILLR}_t = \frac{P_T^\text{High}-P_t^\text{Close}}{P_T^\text{High}-P_T^\text{Low}}
+# $$
+# 
+
+# In[28]:
+
+
+newData["WILLR"] = talib.WILLR(newData.high, newData.low, newData.close)
+
+
+# ## Volume Indicators
+
+# |Function|             Name|
+# |:---|:---|
+# |AD|                   Chaikin A/D Line|
+# |ADOSC|                Chaikin A/D Oscillator|
+# |OBV|                  On Balance Volume|
+
+# In[29]:
+
+
+newData["AD"] = talib.AD(newData.high, newData.low, newData.close, newData.volume)
+newData["ADOSC"] = talib.ADOSC(newData.high, newData.low, newData.close, newData.volume)
+newData["ADOSC"] = talib.OBV(newData.close, newData.volume)
+
+
+# ### Chaikin A/D Line
+
+# The Chaikin Advance/Decline or Accumulation/Distribution Line (AD) is a volume-based indicator designed to measure the cumulative flow of money into and out of an asset. The indicator assumes that the degree of buying or selling pressure can be determined by the location of the close, relative to the high and low for the period. There is buying (sellng) pressure when a stock closes in the upper (lower) half of a period's range. The intention is to signal a change in direction when the indicator diverges from the security price.
+# 
+# The Accumulation/Distribution Line is a running total of each period's Money Flow Volume. It is calculated as follows:
+# 
+# 1. The Money Flow Multiplier (MFI) is the relationship of the close to the high-low range:
+# 2. The MFI is multiplied by the period's volume $V_t$ to come up with a Money Flow Volume (MFV). 
+# 3. A running total of the Money Flow Volume forms the Accumulation Distribution Line:
+# $$
+# \begin{align*}
+# &\text{MFI}_t&=\frac{P_t^\text{Close}-P_t^\text{Low}}{P_t^\text{High}-P_t^\text{Low}}\\
+# &\text{MFV}_t&=\text{MFI}_t \times V_t\\
+# &\text{AD}_t&=\text{AD}_{t-1}+\text{MFV}_t
+# \end{align*}
+# $$
+
+# In[30]:
+
+
+newData["MFI"] = talib.MFI(newData.high, newData.low, newData.close, newData.volume)
+newData["AD"] = talib.MFI(newData.high, newData.low, newData.close, newData.volume)
+
+
+# ### Chaikin A/D Oscillator (ADOSC)
+
+# The Chaikin A/D Oscillator (ADOSC) is the Moving Average Convergence Divergence indicator (MACD) applied to the Chaikin A/D Line. The Chaikin Oscillator intends to predict changes in the Accumulation/Distribution Line.
+# 
+# It is computed as the difference between the 3-day exponential moving average and the 10-day exponential moving average of the Accumulation/Distribution Line.
+
+# In[31]:
+
+
+newData["ADOSC"] = talib.ADOSC(newData.high, newData.low, newData.close, newData.volume)
+
+
+# ### On Balance Volume (OBV)
+
+# The On Balance Volume indicator (OBV) is a cumulative momentum indicator that relates volume to price change. It assumes that OBV changes precede price changes because smart money can be seen flowing into the security by a rising OBV. When the public then moves into the security, both the security and OBV will rise.
+# 
+# The current OBV is computed by adding (subtracting) the current volume to the last OBV if the security closes higher (lower) than the previous close.
+# 
+# $$
+# \text{OBV}_t = 
+# \begin{cases}
+# \text{OBV}_{t-1}+V_t & \text{if }P_t>P_{t-1}\\
+# \text{OBV}_{t-1}-V_t & \text{if }P_t<P_{t-1}\\
+# \text{OBV}_{t-1} & \text{otherwise}
+# \end{cases}
+# $$
+
+# In[32]:
+
+
+newData["OBV"] = talib.OBV(newData.close, newData.volume)
+
+
+# ## Volatility Indicators
+
+# |Function|             Name|
+# |:---|:---|
+# |TRANGE|               True Range|
+# |ATR|                  Average True Range|
+# |NATR|                 Normalized Average True Range|
+
+# In[33]:
+
+
+newData["TRANGE"] = talib.TRANGE(newData.high, newData.low, newData.close)
+newData["ATR"] = talib.ATR(newData.high, newData.low, newData.close)
+
+
+# In[34]:
+
+
+newData["NATR"] = talib.NATR(newData.high, newData.low, newData.close)
+
+
+# ### ATR
+
+# The Average True Range indicator (ATR) shows volatility of the market. It was introduced by Welles Wilder (1978)  and has been used as a component of numerous other indicators since. It aims to anticipate changes in trend such that the higher its value, the higher the probability of a trend change; the lower the indicator’s value, the weaker the current trend.
+# 
+# It is computed as the simple moving average for a period T of the True Range (TRANGE), which measures volatility as the absolute value of the largest recent trading range:
+# $$
+# \text{TRANGE}_t = \max\left[P_t^\text{High} - P_t^\text{low}, \left| P_t^\text{High} - P_{t-1}^\text{Close}\right|, \left| P_t^\text{low} - P_{t-1}^\text{Close}\right|\right]
+# $$
+
+# ### NATR
+
+# The Normalized Average True Range (NATR) is a normalized version of the ATR computed as follows:
+# 
+# $$
+# \text{NATR}_t = \frac{\text{ATR}_t(T)}{P_t^\text{Close}} * 100
+# $$
+# 
+# Normalization make the ATR function more relevant in the folllowing scenarios:
+# - Long term analysis where the price changes drastically.
+# - Cross-market or cross-security ATR comparison.
+
+# ## Rolling Factor Betas
+
+# In[35]:
+
+
+# check advanced financial machine learning
+
+
+# ## get day-ahead return
+
+# In[36]:
+
+
+newData["outcome"] = newData["returns 1"].copy().shift(-1)
+
+
+# ## lösche Ausreißer-Zeilen
+
+# In[37]:
+
+
+newData.date = pd.to_datetime(newData.date, format="%Y-%m-%d")
+newData.index = [newData.ticker, newData.date]
+
+
+# ## Persist results
+
+# In[38]:
+
+
+# lösche erst noch die dollen returns raus weil da aktienwechsel
+newData.to_csv("./us_stocks_newer.csv", index = True)
+
+
+# In[39]:
+
+
+newData
+
+
+# In[ ]:
+
+
+
+
